@@ -293,6 +293,9 @@ run_target_transaction() {
         norm_ok="no"
     fi
 
+    # Never keep prep-norminette debug logs in accepted output.
+    find "$stage_target" -type f -name '.prep-norminette.log' -delete 2>/dev/null || true
+
     norm_changed="$(sed -n 's/^Whitespace normalization changed \([0-9]\+\) file(s), scanned [0-9]\+ file(s).$/\1/p' "$log_norm" | tail -n 1)"
     [[ -n "$norm_changed" ]] || norm_changed=0
 
@@ -373,6 +376,10 @@ run_pipeline() {
     fi
 
     echo "Completed successfully: accepted=$accepted_count reverted=$reverted_count failed=0."
+
+    if [[ -d "$tmp_base" ]] && ! find "$tmp_base" -mindepth 1 -print -quit | grep -q .; then
+        rm -rf "$tmp_base"
+    fi
 }
 
 if [[ $# -gt 0 ]] && [[ "$1" == "--help" || "$1" == "-h" ]]; then

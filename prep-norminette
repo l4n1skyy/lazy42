@@ -302,12 +302,15 @@ resolve_norm_log_file_path() {
 run_norminette_whitespace_loop() {
     local target_dir="$1"
     local norm_bin="$2"
-    local log_file="$target_dir/.prep-norminette.log"
+    local log_file
     local pass
     local ws_count
     local norm_path
     local resolved
     local fixed_any
+
+    log_file="$(mktemp)" || die "failed to create temporary norminette log."
+    tmp_files+=("$log_file")
 
     for pass in $(seq 1 "$MAX_NORM_PASSES"); do
         run_norminette_log "$norm_bin" "$target_dir" "$log_file"
@@ -315,7 +318,6 @@ run_norminette_whitespace_loop() {
 
         if [[ "$ws_count" -eq 0 ]]; then
             echo "Norminette whitespace checks passed (pass $pass)."
-            echo "Norminette log written to '$log_file'."
             return 0
         fi
 
@@ -342,7 +344,6 @@ run_norminette_whitespace_loop() {
     fi
 
     echo "Norminette whitespace checks passed."
-    echo "Norminette log written to '$log_file'."
 }
 
 normalize_file() {
