@@ -6,17 +6,17 @@ Helper scripts for preparing 42 Piscine C code files.
 
 **1. Clone and make executable:**
 ```bash
-git clone <your-repo>
-chmod +rwx scripts/*
+git clone https://github.com/l4n1skyy/lazy42.git
+chmod +rwx lazy42/*
 ```
 
 **2. Configure (one-time):**
 Edit `scripts/prep.config`:
 ```
-SCRIPTS_DIR=/absolute/path/to/your/scripts
-CODE_DIR=/absolute/path/to/your/code
-PREP_USERNAME=your-login
-PREP_EMAIL=your-email@student.42kl.edu.my
+SCRIPTS_DIR='/home/l4n1skyy/Downloads/42kl-piscine-0416/lazy42/'
+CODE_DIR='/home/l4n1skyy/Documents/42kl/'
+PREP_USERNAME=lanusri-
+PREP_EMAIL=lanusri-@student.42kl.edu.my
 ```
 
 **3. Run:**
