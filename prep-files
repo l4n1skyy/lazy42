@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+die() {
+	echo "Error: $*" >&2
+	exit 1
+}
+
+usage() {
+	echo "Usage: $0 <folder>" >&2
+	echo "Examples:" >&2
+	echo "  Fill scripts/prep.config first (SCRIPTS_DIR and CODE_DIR)." >&2
+	echo "  $0 c-01" >&2
+}
+
+require_cmd() {
+	command -v "$1" >/dev/null 2>&1 || die "required command '$1' not found."
+}
+
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+config_file="$script_dir/prep.config"
+
+for cmd in find rm pwd; do
+	require_cmd "$cmd"
+done
+
+abs_dir() {
+	local p="$1"
+
+	[[ -d "$p" ]] || return 1
+	(cd "$p" && pwd)
+}
+
+resolve_dir_arg() {
+	local raw="$1"
+
+	if [[ "$raw" == /* ]]; then
+		abs_dir "$raw" || return 1
+		return
+	fi
+
+	if [[ -d "$raw" ]]; then
+		abs_dir "$raw" || return 1
+		return
+	fi
+
+	abs_dir "$PWD/$raw" || return 1
+}
+
+is_config_mode() {
+	local arg
+
+	[[ $# -gt 0 ]] || return 1
+	for arg in "$@"; do
+		[[ "$arg" == *=* ]] || return 1
+	done
+	return 0
+}
+
+load_config() {
+	[[ -f "$config_file" ]] || die "missing '$config_file'. Fill SCRIPTS_DIR and CODE_DIR first."
+
+	# shellcheck disable=SC1090
+	source "$config_file"
+
+	[[ -n "${SCRIPTS_DIR:-}" ]] || die "SCRIPTS_DIR is not set in '$config_file'."
+	[[ -n "${CODE_DIR:-}" ]] || die "CODE_DIR is not set in '$config_file'."
+
+	abs_dir "$SCRIPTS_DIR" >/dev/null || die "SCRIPTS_DIR '$SCRIPTS_DIR' is not a readable directory."
+	code_root="$(abs_dir "$CODE_DIR")" || die "CODE_DIR '$CODE_DIR' is not a readable directory."
+}
+
+write_config() {
+	local scripts_path="$1"
+	local code_path="$2"
+	local username="$3"
+	local email="$4"
+
+	{
+		printf 'SCRIPTS_DIR=%q\n' "$scripts_path"
+		printf 'CODE_DIR=%q\n' "$code_path"
+		if [[ -n "$username" ]]; then
+			printf 'PREP_USERNAME=%q\n' "$username"
+		fi
+		if [[ -n "$email" ]]; then
+			printf 'PREP_EMAIL=%q\n' "$email"
+		fi
+	} > "$config_file"
+}
+
+configure_only() {
+	local scripts_path="$script_dir"
+	local code_path=""
+	local username=""
+	local email=""
+	local key
+	local value
+	local arg
+
+	if [[ -f "$config_file" ]]; then
+		# shellcheck disable=SC1090
+		source "$config_file"
+		username="${PREP_USERNAME:-}"
+		email="${PREP_EMAIL:-}"
+	fi
+
+	for arg in "$@"; do
+		key="${arg%%=*}"
+		value="${arg#*=}"
+		case "$key" in
+			scripts)
+				scripts_path="$(resolve_dir_arg "$value")" || die "invalid scripts directory '$value'."
+				;;
+			code)
+				code_path="$(resolve_dir_arg "$value")" || die "invalid code directory '$value'."
+				;;
+			username)
+				username="$value"
+				;;
+			email)
+				email="$value"
+				;;
+			*)
+				die "unknown configuration key '$key'. Supported keys: scripts, code, username, email."
+				;;
+		esac
+	done
+
+	[[ -d "$scripts_path" ]] || die "scripts directory '$scripts_path' does not exist."
+	[[ -d "$code_path" ]] || die "code directory '$code_path' does not exist."
+
+	write_config "$scripts_path" "$code_path" "$username" "$email"
+
+	echo "Configuration saved in '$config_file'."
+	echo "scripts=$scripts_path"
+	echo "code=$code_path"
+	if [[ -n "$username" ]]; then
+		echo "username=$username"
+	fi
+	if [[ -n "$email" ]]; then
+		echo "email=$email"
+	fi
+	echo "No scripts were executed."
+}
+
+resolve_target_dir() {
+	local input_path="$1"
+
+	if [[ "$input_path" == /* && -d "$input_path" ]]; then
+		abs_dir "$input_path" || die "failed to resolve '$input_path'."
+		return
+	fi
+
+	if [[ -d "$code_root/$input_path" ]]; then
+		abs_dir "$code_root/$input_path" || die "failed to resolve '$code_root/$input_path'."
+		return
+	fi
+
+	if [[ -d "$input_path" ]]; then
+		abs_dir "$input_path" || die "failed to resolve '$input_path'."
+		return
+	fi
+
+	die "folder '$input_path' not found."
+}
+
+cleanup_tree() {
+	local target_dir="$1"
+	local removed_main=0
+	local removed_pdf=0
+	local removed_aout=0
+	local file
+	local file_dir
+
+	while IFS= read -r -d '' file; do
+		file_dir="$(dirname "$file")"
+		[[ -w "$file_dir" && -x "$file_dir" ]] || die "folder '$file_dir' is not writable."
+		rm -f "$file"
+		removed_main=$((removed_main + 1))
+	done < <(find "$target_dir" -type f -name 'main.c' -print0)
+
+	while IFS= read -r -d '' file; do
+		file_dir="$(dirname "$file")"
+		[[ -w "$file_dir" && -x "$file_dir" ]] || die "folder '$file_dir' is not writable."
+		rm -f "$file"
+		removed_pdf=$((removed_pdf + 1))
+	done < <(find "$target_dir" -type f -name '*.pdf' -print0)
+
+	while IFS= read -r -d '' file; do
+		file_dir="$(dirname "$file")"
+		[[ -w "$file_dir" && -x "$file_dir" ]] || die "folder '$file_dir' is not writable."
+		rm -f "$file"
+		removed_aout=$((removed_aout + 1))
+	done < <(find "$target_dir" -type f -name 'a.out' -print0)
+
+	echo "Removed $removed_main main.c file(s), $removed_aout a.out file(s), and $removed_pdf pdf file(s) under '$target_dir'."
+}
+
+for arg in "$@"; do
+	if [[ "$arg" == *=* ]]; then
+		die "configuration arguments are disabled. Edit '$config_file' and rerun."
+	fi
+done
+
+if [[ $# -ne 1 ]]; then
+	usage
+	exit 1
+fi
+
+input="$1"
+[[ -n "$input" ]] || {
+	usage
+	exit 1
+}
+
+load_config
+
+target_dir="$(resolve_target_dir "$input")"
+[[ -r "$target_dir" ]] || die "folder '$target_dir' is not readable."
+
+cleanup_tree "$target_dir"

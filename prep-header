@@ -1,0 +1,408 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+die() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+warn() {
+    echo "Warning: $*" >&2
+}
+
+usage() {
+    echo "Usage: $0 <folder>" >&2
+    echo "Examples:" >&2
+    echo "  Fill scripts/prep.config first (SCRIPTS_DIR and CODE_DIR)." >&2
+    echo "  $0 c-01" >&2
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "required command '$1' not found."
+}
+
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+config_file="$script_dir/prep.config"
+
+tmp_files=()
+
+cleanup() {
+    local f
+
+    for f in "${tmp_files[@]:-}"; do
+        if [[ -n "$f" && -e "$f" ]]; then
+            rm -f "$f"
+        fi
+    done
+}
+
+trap cleanup EXIT
+
+for cmd in awk basename cat chmod date dirname find grep mktemp mv pwd rm sed sort; do
+    require_cmd "$cmd"
+done
+
+abs_dir() {
+    local p="$1"
+
+    [[ -d "$p" ]] || return 1
+    (cd "$p" && pwd)
+}
+
+resolve_dir_arg() {
+    local raw="$1"
+
+    if [[ "$raw" == /* ]]; then
+        abs_dir "$raw" || return 1
+        return
+    fi
+
+    if [[ -d "$raw" ]]; then
+        abs_dir "$raw" || return 1
+        return
+    fi
+
+    abs_dir "$PWD/$raw" || return 1
+}
+
+is_config_mode() {
+    local arg
+
+    [[ $# -gt 0 ]] || return 1
+    for arg in "$@"; do
+        [[ "$arg" == *=* ]] || return 1
+    done
+    return 0
+}
+
+load_config() {
+    [[ -f "$config_file" ]] || die "missing '$config_file'. Fill SCRIPTS_DIR and CODE_DIR first."
+
+    # shellcheck disable=SC1090
+    source "$config_file"
+
+    [[ -n "${SCRIPTS_DIR:-}" ]] || die "SCRIPTS_DIR is not set in '$config_file'."
+    [[ -n "${CODE_DIR:-}" ]] || die "CODE_DIR is not set in '$config_file'."
+
+    abs_dir "$SCRIPTS_DIR" >/dev/null || die "SCRIPTS_DIR '$SCRIPTS_DIR' is not a readable directory."
+    code_root="$(abs_dir "$CODE_DIR")" || die "CODE_DIR '$CODE_DIR' is not a readable directory."
+}
+
+write_config() {
+    local scripts_path="$1"
+    local code_path="$2"
+    local username="$3"
+    local email="$4"
+
+    {
+        printf 'SCRIPTS_DIR=%q\n' "$scripts_path"
+        printf 'CODE_DIR=%q\n' "$code_path"
+        if [[ -n "$username" ]]; then
+            printf 'PREP_USERNAME=%q\n' "$username"
+        fi
+        if [[ -n "$email" ]]; then
+            printf 'PREP_EMAIL=%q\n' "$email"
+        fi
+    } > "$config_file"
+}
+
+configure_only() {
+    local scripts_path="$script_dir"
+    local code_path=""
+    local username=""
+    local email=""
+    local key
+    local value
+    local arg
+
+    if [[ -f "$config_file" ]]; then
+        # shellcheck disable=SC1090
+        source "$config_file"
+        username="${PREP_USERNAME:-}"
+        email="${PREP_EMAIL:-}"
+    fi
+
+    for arg in "$@"; do
+        key="${arg%%=*}"
+        value="${arg#*=}"
+        case "$key" in
+            scripts)
+                scripts_path="$(resolve_dir_arg "$value")" || die "invalid scripts directory '$value'."
+                ;;
+            code)
+                code_path="$(resolve_dir_arg "$value")" || die "invalid code directory '$value'."
+                ;;
+            username)
+                username="$value"
+                ;;
+            email)
+                email="$value"
+                ;;
+            *)
+                die "unknown configuration key '$key'. Supported keys: scripts, code, username, email."
+                ;;
+        esac
+    done
+
+    [[ -d "$scripts_path" ]] || die "scripts directory '$scripts_path' does not exist."
+    [[ -d "$code_path" ]] || die "code directory '$code_path' does not exist."
+
+    write_config "$scripts_path" "$code_path" "$username" "$email"
+
+    echo "Configuration saved in '$config_file'."
+    echo "scripts=$scripts_path"
+    echo "code=$code_path"
+    if [[ -n "$username" ]]; then
+        echo "username=$username"
+    fi
+    if [[ -n "$email" ]]; then
+        echo "email=$email"
+    fi
+    echo "No scripts were executed."
+}
+
+normalize_email() {
+    local v="$1"
+
+    v="${v#<}"
+    v="${v%>}"
+    printf '<%s>\n' "$v"
+}
+
+extract_by_value() {
+    local from_file="$1"
+    local line
+
+    line="$(grep -m1 '^/\*   By: ' "$from_file" || true)"
+    if [[ -z "$line" ]]; then
+        return 0
+    fi
+    line="${line#/*   By: }"
+    line="${line%    +#+  +:+       +#+        */}"
+    printf '%s\n' "$line"
+}
+
+resolve_target_dir() {
+    local input_path="$1"
+
+    if [[ "$input_path" == /* && -d "$input_path" ]]; then
+        abs_dir "$input_path" || die "failed to resolve '$input_path'."
+        return
+    fi
+
+    if [[ -d "$code_root/$input_path" ]]; then
+        abs_dir "$code_root/$input_path" || die "failed to resolve '$code_root/$input_path'."
+        return
+    fi
+
+    if [[ -d "$input_path" ]]; then
+        abs_dir "$input_path" || die "failed to resolve '$input_path'."
+        return
+    fi
+
+    die "folder '$input_path' not found."
+}
+
+resolve_by_value() {
+    local target_dir="$1"
+    local sample
+    local found
+    local cfg_user
+    local cfg_email
+
+    if [[ -n "${HEADER_BY:-}" ]]; then
+        printf '%s\n' "$HEADER_BY"
+        return
+    fi
+
+    cfg_user="${PREP_USERNAME:-}"
+    cfg_email="${PREP_EMAIL:-}"
+    if [[ -n "$cfg_user" && -n "$cfg_email" ]]; then
+        printf '%s %s\n' "$cfg_user" "$(normalize_email "$cfg_email")"
+        return
+    fi
+
+    while IFS= read -r sample; do
+        found="$(extract_by_value "$sample")"
+        if [[ -n "$found" ]]; then
+            printf '%s\n' "$found"
+            return
+        fi
+    done < <(find "$target_dir" -type f -name '*.c' | sort)
+
+    sample="$code_root/c-00/ex00/ft_putchar.c"
+    if [[ -f "$sample" ]]; then
+        found="$(extract_by_value "$sample")"
+        if [[ -n "$found" ]]; then
+            printf '%s\n' "$found"
+            return
+        fi
+    fi
+
+    sample="$script_dir/../c-00/ex00/ft_putchar.c"
+    if [[ -f "$sample" ]]; then
+        found="$(extract_by_value "$sample")"
+        if [[ -n "$found" ]]; then
+            printf '%s\n' "$found"
+            return
+        fi
+    fi
+
+    login="${USER:-student}"
+    printf '%s\n' "$login <$login@student.42kl.edu.my>"
+}
+
+render_line() {
+    local left="$1"
+    local right="$2"
+    local spaces
+
+    spaces=$((76 - ${#left} - ${#right}))
+    if ((spaces < 0)); then
+        return 1
+    fi
+    printf '/*%s%*s%s*/\n' "$left" "$spaces" "" "$right"
+}
+
+write_header() {
+    local file_path="$1"
+    local file_name
+    local now
+
+    file_name="$(basename "$file_path")"
+    now="$(date '+%Y/%m/%d %H:%M:%S')"
+
+    printf '/* ************************************************************************** */\n'
+    printf '/*                                                                            */\n'
+    printf '/*                                                        :::      ::::::::   */\n'
+    render_line "   $file_name" " :+:      :+:    :+:   " || return 1
+    printf '/*                                                    +:+ +:+         +:+     */\n'
+    render_line "   By: $by_value" " +#+  +:+       +#+        " || return 1
+    printf '/*                                                +#+#+#+#+#+   +#+           */\n'
+    render_line "   Created: $now by $author_login" " #+#    #+#             " || return 1
+    render_line "   Updated: $now by $author_login" " ###   ########.fr       " || return 1
+    printf '/*                                                                            */\n'
+    printf '/* ************************************************************************** */\n'
+}
+
+process_file() {
+    local c_file="$1"
+    local tmp_body
+    local tmp_out
+
+    if [[ ! -r "$c_file" ]]; then
+        warn "skipping unreadable file '$c_file'."
+        return 1
+    fi
+    if [[ ! -w "$c_file" ]]; then
+        warn "skipping unwritable file '$c_file'."
+        return 1
+    fi
+    if [[ ! -w "$(dirname "$c_file")" ]]; then
+        warn "skipping '$c_file' because its directory is not writable."
+        return 1
+    fi
+
+    tmp_body="$(mktemp)" || {
+        warn "failed to create temporary body file for '$c_file'."
+        return 1
+    }
+    tmp_out="$(mktemp)" || {
+        warn "failed to create temporary output file for '$c_file'."
+        return 1
+    }
+    tmp_files+=("$tmp_body" "$tmp_out")
+
+    if [[ "$(sed -n '1p' "$c_file")" == "/* ************************************************************************** */" && "$(sed -n '11p' "$c_file")" == "/* ************************************************************************** */" ]]; then
+        if ! awk 'NR <= 11 { next } NR == 12 && $0 == "" { next } { print }' "$c_file" > "$tmp_body"; then
+            warn "failed to strip existing header from '$c_file'."
+            return 1
+        fi
+    else
+        if ! cat "$c_file" > "$tmp_body"; then
+            warn "failed to read '$c_file'."
+            return 1
+        fi
+    fi
+
+    if ! {
+        write_header "$c_file"
+        printf "\n"
+        cat "$tmp_body"
+    } > "$tmp_out"; then
+        warn "failed to write header for '$c_file'."
+        return 1
+    fi
+
+    if ! chmod --reference="$c_file" "$tmp_out"; then
+        warn "failed to preserve permissions for '$c_file'."
+        return 1
+    fi
+
+    if ! mv "$tmp_out" "$c_file"; then
+        warn "failed to replace '$c_file'."
+        return 1
+    fi
+
+    rm -f "$tmp_body" "$tmp_out"
+    return 0
+}
+
+for arg in "$@"; do
+    if [[ "$arg" == *=* ]]; then
+        die "configuration arguments are disabled. Edit '$config_file' and rerun."
+    fi
+done
+
+if [[ $# -ne 1 ]]; then
+    usage
+    exit 1
+fi
+
+input="$1"
+[[ -n "$input" ]] || {
+    usage
+    exit 1
+}
+
+load_config
+
+target_dir="$(resolve_target_dir "$input")"
+[[ -r "$target_dir" ]] || die "folder '$target_dir' is not readable."
+
+by_value="$(resolve_by_value "$target_dir")"
+if [[ "$by_value" == *$'\n'* ]]; then
+    die "resolved By value contains invalid newline characters."
+fi
+
+by_value="$(printf '%s' "$by_value" | sed -E 's/[[:space:]]+$//')"
+[[ -n "$by_value" ]] || die "resolved By value is empty."
+
+author_login="$(printf '%s' "$by_value" | sed -E 's/ <.*$//')"
+[[ -n "$author_login" ]] || die "could not resolve author login from By value '$by_value'."
+
+if ! mapfile -t c_files < <(find "$target_dir" -type f -name '*.c' 2>/dev/null | sort); then
+    die "failed to scan '$target_dir' for .c files."
+fi
+
+if [[ ${#c_files[@]} -eq 0 ]]; then
+    die "no .c files found under '$target_dir'."
+fi
+
+processed=0
+failed=0
+
+for c_file in "${c_files[@]}"; do
+    if process_file "$c_file"; then
+        processed=$((processed + 1))
+    else
+        failed=$((failed + 1))
+    fi
+done
+
+if ((failed > 0)); then
+    die "header added/updated in $processed file(s), failed for $failed file(s)."
+fi
+
+echo "Header added/updated in $processed file(s) under '$target_dir'."

@@ -1,0 +1,393 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+die() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+usage() {
+    echo "Usage:" >&2
+    echo "  $0 [c-01 c-02 ...]" >&2
+    echo "" >&2
+    echo "Before running, fill scripts/prep.config with SCRIPTS_DIR and CODE_DIR." >&2
+    echo "Examples:" >&2
+    echo "  $0" >&2
+    echo "  $0 c-01 c-02" >&2
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "required command '$1' not found."
+}
+
+for cmd in awk cp find grep mktemp mv pwd rm sed sort xargs; do
+    require_cmd "$cmd"
+done
+
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+config_file="$script_dir/prep.config"
+
+abs_dir() {
+    local p="$1"
+
+    [[ -d "$p" ]] || return 1
+    (cd "$p" && pwd)
+}
+
+load_config() {
+    [[ -f "$config_file" ]] || die "missing '$config_file'. Fill SCRIPTS_DIR and CODE_DIR first."
+
+    # shellcheck disable=SC1090
+    source "$config_file"
+
+    [[ -n "${SCRIPTS_DIR:-}" ]] || die "SCRIPTS_DIR is not set in '$config_file'."
+    [[ -n "${CODE_DIR:-}" ]] || die "CODE_DIR is not set in '$config_file'."
+}
+
+resolve_targets() {
+    local code_dir="$1"
+    shift
+    local input
+
+    if [[ $# -eq 0 ]]; then
+        if ! mapfile -t TARGETS < <(find "$code_dir" -maxdepth 1 -mindepth 1 -type d -name 'c-[0-9][0-9]' | sort); then
+            die "failed to discover c-xx folders under '$code_dir'."
+        fi
+        [[ ${#TARGETS[@]} -gt 0 ]] || die "no c-xx folders found under '$code_dir'."
+        return
+    fi
+
+    TARGETS=()
+    for input in "$@"; do
+        if [[ "$input" == /* && -d "$input" ]]; then
+            TARGETS+=("$(abs_dir "$input")")
+        elif [[ -d "$code_dir/$input" ]]; then
+            TARGETS+=("$(abs_dir "$code_dir/$input")")
+        elif [[ -d "$input" ]]; then
+            TARGETS+=("$(abs_dir "$input")")
+        else
+            die "target folder '$input' not found."
+        fi
+    done
+}
+
+resolve_tmp_base() {
+    local code_dir="$1"
+    local parent
+
+    if [[ "$(basename "$code_dir")" == "test" && "$(basename "$(dirname "$code_dir")")" == "code" ]]; then
+        parent="$(dirname "$(dirname "$code_dir")")"
+    else
+        parent="$(dirname "$code_dir")"
+    fi
+    printf '%s/tmp\n' "$parent"
+}
+
+count_norm_errors() {
+    local target_dir="$1"
+    local norm_bin="$2"
+    local log_file="$3"
+
+    if ! find "$target_dir" -type f \( -name '*.c' -o -name '*.h' \) -print0 | sort -z | xargs -0 "$norm_bin" > "$log_file" 2>&1; then
+        true
+    fi
+    grep -c '^Error:' "$log_file" 2>/dev/null || true
+}
+
+resolve_norm_bin() {
+    local code_dir="$1"
+    local candidate
+
+    if [[ -n "${NORMINETTE_BIN:-}" && -x "${NORMINETTE_BIN:-}" ]]; then
+        printf '%s\n' "$NORMINETTE_BIN"
+        return
+    fi
+
+    for candidate in \
+        "$code_dir/.venv/bin/norminette" \
+        "$(dirname "$code_dir")/.venv/bin/norminette" \
+        "$(dirname "$(dirname "$code_dir")")/code/.venv/bin/norminette"; do
+        if [[ -x "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return
+        fi
+    done
+
+    if command -v norminette >/dev/null 2>&1; then
+        command -v norminette
+        return
+    fi
+
+    printf '%s\n' ""
+}
+
+prompt_accept_or_revert() {
+    local ans=""
+
+    if [[ -n "${PREP_ALL_DECISION:-}" ]]; then
+        case "$PREP_ALL_DECISION" in
+            y|Y|yes|YES|accept)
+                printf 'accept\n'
+                return
+                ;;
+            n|N|no|NO|revert)
+                printf 'revert\n'
+                return
+                ;;
+            *)
+                echo "Invalid PREP_ALL_DECISION='$PREP_ALL_DECISION'; defaulting to revert." >&2
+                printf 'revert\n'
+                return
+                ;;
+        esac
+    fi
+
+    if [[ ! -t 0 ]]; then
+        echo "Non-interactive mode detected: defaulting to revert." >&2
+        printf 'revert\n'
+        return
+    fi
+
+    while true; do
+        printf 'Accept changes? [Y/N]: ' >&2
+        read -r ans || ans="revert"
+        case "$ans" in
+            y|Y|yes|YES|accept)
+                printf 'accept\n'
+                return
+                ;;
+            n|N|no|NO|revert)
+                printf 'revert\n'
+                return
+                ;;
+            *)
+                echo "Please type Y or N." >&2
+                ;;
+        esac
+    done
+}
+
+print_remaining_norm_errors() {
+    local log_file="$1"
+
+    [[ -f "$log_file" ]] || return 0
+
+    awk '
+BEGIN {
+    printed = 0;
+}
+/: Error!$/ {
+    current = $0;
+    sub(/: Error!$/, "", current);
+    next;
+}
+/^[^:]+:[[:space:]]*Error:[[:space:]]*[A-Z_]+/ {
+    line = $0;
+    file = line;
+    sub(/:[[:space:]]*Error:[[:space:]]*[A-Z_]+.*/, "", file);
+    msg = line;
+    sub(/^[^:]+:[[:space:]]*/, "", msg);
+    print file " -> " msg;
+    printed = 1;
+    next;
+}
+/^Error:[[:space:]]*[A-Z_]+/ {
+    if (current != "") {
+        print current " -> " $0;
+        printed = 1;
+        next;
+    }
+    print "(unknown file) -> " $0;
+    printed = 1;
+    next;
+}
+END {
+    if (printed == 0)
+        exit 1;
+}
+' "$log_file"
+}
+
+run_target_transaction() {
+    local scripts_dir="$1"
+    local code_dir="$2"
+    local target="$3"
+    local tmp_base="$4"
+
+    local prep_main="$scripts_dir/prep-main"
+    local prep_files="$scripts_dir/prep-files"
+    local prep_header="$scripts_dir/prep-header"
+    local prep_norminette="$scripts_dir/prep-norminette"
+    local norm_bin
+
+    local stage_root
+    local stage_target
+    local log_main
+    local log_files
+    local log_header
+    local log_norm
+    local log_norm_final
+    local accepted=0
+    local main_ok="no"
+    local files_ok="no"
+    local header_ok="no"
+    local norm_ok="no"
+    local norm_changed=0
+    local norm_left=0
+    local decision
+
+    mkdir -p "$tmp_base"
+    norm_bin="$(resolve_norm_bin "$code_dir")"
+    stage_root="$(mktemp -d "$tmp_base/prep-all.XXXXXX")"
+    stage_target="$stage_root/$(basename "$target")"
+
+    log_main="$stage_root/prep-main.log"
+    log_files="$stage_root/prep-files.log"
+    log_header="$stage_root/prep-header.log"
+    log_norm="$stage_root/prep-norm.log"
+    log_norm_final="$stage_root/norminette-final.log"
+
+    cleanup_stage() {
+        if [[ "${accepted:-0}" -eq 0 && -n "${stage_root:-}" && -d "${stage_root:-}" ]]; then
+            rm -rf "$stage_root"
+        fi
+    }
+    trap cleanup_stage EXIT INT TERM
+
+    cp -a "$target" "$stage_target"
+
+    if CODE_ROOT="$code_dir" "$prep_main" "$stage_target" > "$log_main" 2>&1; then
+        main_ok="yes"
+    else
+        echo "prep-main failed for $(basename "$target"). Reverting staged changes."
+        sed -n '1,120p' "$log_main"
+        trap - EXIT INT TERM
+        cleanup_stage
+        return 1
+    fi
+
+    if CODE_ROOT="$code_dir" "$prep_files" "$stage_target" > "$log_files" 2>&1; then
+        files_ok="yes"
+    else
+        echo "prep-files failed for $(basename "$target"). Reverting staged changes."
+        sed -n '1,120p' "$log_files"
+        trap - EXIT INT TERM
+        cleanup_stage
+        return 1
+    fi
+
+    if CODE_ROOT="$code_dir" "$prep_header" "$stage_target" > "$log_header" 2>&1; then
+        header_ok="yes"
+    else
+        echo "prep-header failed for $(basename "$target"). Reverting staged changes."
+        sed -n '1,120p' "$log_header"
+        trap - EXIT INT TERM
+        cleanup_stage
+        return 1
+    fi
+
+    if CODE_ROOT="$code_dir" "$prep_norminette" "$stage_target" > "$log_norm" 2>&1; then
+        norm_ok="yes"
+    else
+        norm_ok="no"
+    fi
+
+    norm_changed="$(sed -n 's/^Whitespace normalization changed \([0-9]\+\) file(s), scanned [0-9]\+ file(s).$/\1/p' "$log_norm" | tail -n 1)"
+    [[ -n "$norm_changed" ]] || norm_changed=0
+
+    if [[ -n "$norm_bin" && -x "$norm_bin" ]]; then
+        norm_left="$(count_norm_errors "$stage_target" "$norm_bin" "$log_norm_final")"
+    else
+        norm_left="unknown"
+    fi
+
+    echo ""
+    echo "Staged summary for $(basename "$target"):"
+    echo "- main moved/commented successfully: $main_ok"
+    echo "- cleanup files step succeeded: $files_ok"
+    echo "- header step succeeded: $header_ok"
+    echo "- prep-norminette succeeded: $norm_ok"
+    echo "- norminette changes applied: $norm_changed"
+    echo "- norminette errors left: $norm_left"
+
+    if [[ "$norm_left" != "unknown" && "$norm_left" -gt 0 ]]; then
+        echo "Remaining norminette errors:"
+        if ! print_remaining_norm_errors "$log_norm_final"; then
+            grep '^Error:' "$log_norm_final" || echo "- unable to parse norminette error details"
+        fi
+    fi
+
+    decision="$(prompt_accept_or_revert)"
+    if [[ "$decision" == "accept" ]]; then
+        rm -rf "$target"
+        mv "$stage_target" "$target"
+        accepted=1
+        rm -rf "$stage_root"
+        trap - EXIT INT TERM
+        echo "Accepted staged changes for $(basename "$target")."
+        return 0
+    fi
+
+    echo "Reverted staged changes for $(basename "$target")."
+    trap - EXIT INT TERM
+    cleanup_stage
+    return 2
+}
+
+run_pipeline() {
+    local scripts_dir="$1"
+    local code_dir="$2"
+    shift 2
+
+    local target
+    local accepted_count=0
+    local reverted_count=0
+    local fail=0
+    local tmp_base
+
+    [[ -x "$scripts_dir/prep-main" ]] || die "missing or non-executable '$scripts_dir/prep-main'."
+    [[ -x "$scripts_dir/prep-files" ]] || die "missing or non-executable '$scripts_dir/prep-files'."
+    [[ -x "$scripts_dir/prep-header" ]] || die "missing or non-executable '$scripts_dir/prep-header'."
+    [[ -x "$scripts_dir/prep-norminette" ]] || die "missing or non-executable '$scripts_dir/prep-norminette'."
+
+    resolve_targets "$code_dir" "$@"
+    tmp_base="$(resolve_tmp_base "$code_dir")"
+
+    for target in "${TARGETS[@]}"; do
+        echo "Processing $(basename "$target") in staged transaction..."
+        if run_target_transaction "$scripts_dir" "$code_dir" "$target" "$tmp_base"; then
+            accepted_count=$((accepted_count + 1))
+        else
+            rc=$?
+            if [[ "$rc" -eq 2 ]]; then
+                reverted_count=$((reverted_count + 1))
+            else
+                fail=$((fail + 1))
+            fi
+        fi
+    done
+
+    if ((fail > 0)); then
+        die "completed with failures: accepted=$accepted_count reverted=$reverted_count failed=$fail"
+    fi
+
+    echo "Completed successfully: accepted=$accepted_count reverted=$reverted_count failed=0."
+}
+
+if [[ $# -gt 0 ]] && [[ "$1" == "--help" || "$1" == "-h" ]]; then
+    usage
+    exit 0
+fi
+
+for arg in "$@"; do
+    if [[ "$arg" == *=* ]]; then
+        die "configuration arguments are disabled. Edit '$config_file' and rerun."
+    fi
+done
+
+load_config
+SCRIPTS_DIR="$(abs_dir "$SCRIPTS_DIR")" || die "configured scripts directory '$SCRIPTS_DIR' is invalid."
+CODE_DIR="$(abs_dir "$CODE_DIR")" || die "configured code directory '$CODE_DIR' is invalid."
+
+run_pipeline "$SCRIPTS_DIR" "$CODE_DIR" "$@"

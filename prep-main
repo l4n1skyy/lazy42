@@ -1,0 +1,645 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+die() {
+	echo "Error: $*" >&2
+	exit 1
+}
+
+usage() {
+	echo "Usage: $0 <module/file.c | folder>" >&2
+	echo "Examples:" >&2
+	echo "  Fill scripts/prep.config first (SCRIPTS_DIR and CODE_DIR)." >&2
+	echo "  $0 c-01/ft_ft.c" >&2
+	echo "  $0 c-01" >&2
+}
+
+require_cmd() {
+	command -v "$1" >/dev/null 2>&1 || die "required command '$1' not found."
+}
+
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+config_file="$script_dir/prep.config"
+
+tmp_files=()
+
+cleanup() {
+	local f
+
+	for f in "${tmp_files[@]:-}"; do
+		if [[ -n "$f" && -e "$f" ]]; then
+			rm -f "$f"
+		fi
+	done
+}
+
+trap cleanup EXIT
+
+for cmd in awk basename cat chmod dirname find grep mktemp mv pwd rm sed sort; do
+	require_cmd "$cmd"
+done
+
+abs_dir() {
+	local p="$1"
+
+	[[ -d "$p" ]] || return 1
+	(cd "$p" && pwd)
+}
+
+abs_file() {
+	local p="$1"
+	local d
+
+	[[ -f "$p" ]] || return 1
+	d="$(abs_dir "$(dirname "$p")")" || return 1
+	printf '%s/%s\n' "$d" "$(basename "$p")"
+}
+
+resolve_dir_arg() {
+	local raw="$1"
+
+	if [[ "$raw" == /* ]]; then
+		abs_dir "$raw" || return 1
+		return
+	fi
+
+	if [[ -d "$raw" ]]; then
+		abs_dir "$raw" || return 1
+		return
+	fi
+
+	abs_dir "$PWD/$raw" || return 1
+}
+
+is_config_mode() {
+	local arg
+
+	[[ $# -gt 0 ]] || return 1
+	for arg in "$@"; do
+		[[ "$arg" == *=* ]] || return 1
+	done
+	return 0
+}
+
+load_config() {
+	[[ -f "$config_file" ]] || die "missing '$config_file'. Fill SCRIPTS_DIR and CODE_DIR first."
+
+	# shellcheck disable=SC1090
+	source "$config_file"
+
+	[[ -n "${SCRIPTS_DIR:-}" ]] || die "SCRIPTS_DIR is not set in '$config_file'."
+	[[ -n "${CODE_DIR:-}" ]] || die "CODE_DIR is not set in '$config_file'."
+
+	abs_dir "$SCRIPTS_DIR" >/dev/null || die "SCRIPTS_DIR '$SCRIPTS_DIR' is not a readable directory."
+	code_root="$(abs_dir "$CODE_DIR")" || die "CODE_DIR '$CODE_DIR' is not a readable directory."
+}
+
+write_config() {
+	local scripts_path="$1"
+	local code_path="$2"
+	local username="$3"
+	local email="$4"
+
+	{
+		printf 'SCRIPTS_DIR=%q\n' "$scripts_path"
+		printf 'CODE_DIR=%q\n' "$code_path"
+		if [[ -n "$username" ]]; then
+			printf 'PREP_USERNAME=%q\n' "$username"
+		fi
+		if [[ -n "$email" ]]; then
+			printf 'PREP_EMAIL=%q\n' "$email"
+		fi
+	} > "$config_file"
+}
+
+configure_only() {
+	local scripts_path="$script_dir"
+	local code_path=""
+	local username=""
+	local email=""
+	local key
+	local value
+	local arg
+
+	if [[ -f "$config_file" ]]; then
+		# shellcheck disable=SC1090
+		source "$config_file"
+		username="${PREP_USERNAME:-}"
+		email="${PREP_EMAIL:-}"
+	fi
+
+	for arg in "$@"; do
+		key="${arg%%=*}"
+		value="${arg#*=}"
+		case "$key" in
+			scripts)
+				scripts_path="$(resolve_dir_arg "$value")" || die "invalid scripts directory '$value'."
+				;;
+			code)
+				code_path="$(resolve_dir_arg "$value")" || die "invalid code directory '$value'."
+				;;
+			username)
+				username="$value"
+				;;
+			email)
+				email="$value"
+				;;
+			*)
+				die "unknown configuration key '$key'. Supported keys: scripts, code, username, email."
+				;;
+		esac
+	done
+
+	[[ -d "$scripts_path" ]] || die "scripts directory '$scripts_path' does not exist."
+	[[ -d "$code_path" ]] || die "code directory '$code_path' does not exist."
+
+	write_config "$scripts_path" "$code_path" "$username" "$email"
+
+	echo "Configuration saved in '$config_file'."
+	echo "scripts=$scripts_path"
+	echo "code=$code_path"
+	if [[ -n "$username" ]]; then
+		echo "username=$username"
+	fi
+	if [[ -n "$email" ]]; then
+		echo "email=$email"
+	fi
+	echo "No scripts were executed."
+}
+
+extract_main_to_tmp() {
+	local from_main="$1"
+	local tmp_main="$2"
+
+	if ! awk '
+BEGIN {
+	capture = 0;
+	depth = 0;
+	saw_open = 0;
+	found_main = 0;
+}
+{
+	line = $0;
+	sub(/\/\/.*/, "", line);
+	sub(/[ \t]+$/, "", line);
+
+	if (!capture && line ~ /^[[:space:]]*int[[:space:]]+main[[:space:]]*[(]/) {
+		capture = 1;
+		found_main = 1;
+	}
+
+	# Keep everything up to the end of main(), including pre-main includes/defines.
+	print line;
+
+	if (!capture)
+		next;
+
+	open_count = gsub(/\{/, "{", line);
+	close_count = gsub(/\}/, "}", line);
+	depth += open_count - close_count;
+	if (open_count > 0)
+		saw_open = 1;
+	if (saw_open && depth == 0)
+		exit;
+}
+END {
+	if (!found_main || !saw_open || depth != 0)
+		exit 1;
+}
+' "$from_main" > "$tmp_main"; then
+		return 1
+	fi
+
+	[[ -s "$tmp_main" ]] || return 1
+}
+
+file_has_active_main() {
+	local f="$1"
+
+	awk '
+BEGIN {
+	in_block = 0;
+	found = 0;
+}
+{
+	line = $0;
+	work = line;
+	if (in_block) {
+		if (sub(/^.*\*\//, "", work))
+			in_block = 0;
+		else
+			next;
+	}
+	while (1) {
+		if (sub(/\/\*.*\*\//, "", work))
+			continue;
+		if (match(work, /\/\*/)) {
+			work = substr(work, 1, RSTART - 1);
+			in_block = 1;
+		}
+		break;
+	}
+	sub(/\/\/.*/, "", work);
+	if (work ~ /^[[:space:]]*int[[:space:]]+main[[:space:]]*\(/) {
+		found = 1;
+		exit;
+	}
+}
+END {
+	if (found)
+		exit 0;
+	exit 1;
+}
+' "$f"
+}
+
+comment_main_in_file() {
+	local target_file="$1"
+	local tmp_target
+
+	[[ -f "$target_file" ]] || die "target file '$target_file' not found."
+	[[ -r "$target_file" ]] || die "target file '$target_file' is not readable."
+	[[ -w "$target_file" ]] || die "target file '$target_file' is not writable."
+	[[ -w "$(dirname "$target_file")" ]] || die "directory '$(dirname "$target_file")' is not writable."
+
+	if ! file_has_active_main "$target_file"; then
+		echo "No active main() found in '$target_file'; skipping in-file main comment step."
+		return 0
+	fi
+
+	tmp_target="$(mktemp)" || die "failed to create temporary output file."
+	tmp_files+=("$tmp_target")
+
+	if ! awk '
+BEGIN {
+	capture = 0;
+	depth = 0;
+	saw_open = 0;
+	done = 0;
+	skip_after = 0;
+	out_count = 0;
+		in_block = 0;
+}
+function emit(s) {
+	out[++out_count] = s;
+}
+{
+		line_for_check = $0;
+		if (in_block) {
+			if (sub(/^.*\*\//, "", line_for_check))
+				in_block = 0;
+			else
+				line_for_check = "";
+		}
+		while (!capture && !done && line_for_check != "") {
+			if (sub(/\/\*.*\*\//, "", line_for_check))
+				continue;
+			if (match(line_for_check, /\/\*/)) {
+				line_for_check = substr(line_for_check, 1, RSTART - 1);
+				in_block = 1;
+			}
+			break;
+		}
+		sub(/\/\/.*/, "", line_for_check);
+
+		if (!capture && !done && line_for_check ~ /^[[:space:]]*int[[:space:]]+main[[:space:]]*[(]/)
+		{
+			while (out_count > 0 && out[out_count] ~ /^[[:space:]]*$/)
+				out_count--;
+			capture = 1;
+			emit("/*");
+		}
+	if (capture) {
+		line = $0;
+		sub(/\/\/.*/, "", line);
+		sub(/[ \t]+$/, "", line);
+		emit(line);
+		line = line;
+		open_count = gsub(/\{/, "{", line);
+		line = line;
+		close_count = gsub(/\}/, "}", line);
+		depth += open_count - close_count;
+		if (open_count > 0)
+			saw_open = 1;
+		if (saw_open && depth == 0) {
+			emit("*/");
+			capture = 0;
+			done = 1;
+			skip_after = 1;
+		}
+		next;
+	}
+	if (skip_after) {
+		if ($0 ~ /^[[:space:]]*$/)
+			next;
+		skip_after = 0;
+	}
+	emit($0);
+}
+END {
+	if (!done)
+		exit 1;
+	for (i = 1; i <= out_count; i++)
+		print out[i];
+}
+' "$target_file" > "$tmp_target"; then
+		die "failed to comment out main() in '$target_file'."
+	fi
+
+	chmod --reference="$target_file" "$tmp_target" || die "failed to preserve permissions for '$target_file'."
+	mv "$tmp_target" "$target_file" || die "failed to update '$target_file'."
+
+	echo "Block-commented in-file main() in '$target_file'."
+}
+
+choose_target_for_main() {
+	local main_path="$1"
+	local dir
+	local candidates
+	local fn_names
+	local matches
+	local fn
+	local candidate
+	declare -A seen
+
+	dir="$(dirname "$main_path")"
+
+	if ! mapfile -t candidates < <(find "$dir" -maxdepth 1 -type f -name '*.c' ! -name 'main.c' | sort); then
+		die "failed to list candidate .c files in '$dir'."
+	fi
+	if [[ ${#candidates[@]} -eq 0 ]]; then
+		die "no target .c file found beside '$main_path'."
+	fi
+
+	if ! mapfile -t fn_names < <(
+		awk '
+BEGIN {
+	capture = 0;
+	depth = 0;
+	saw_open = 0;
+}
+{
+	if (!capture && $0 ~ /^[[:space:]]*int[[:space:]]+main[[:space:]]*[(]/)
+		capture = 1;
+	if (capture) {
+		line = $0;
+		sub(/\/\/.*$/, "", line);
+		while (match(line, /[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(/)) {
+			token = substr(line, RSTART, RLENGTH);
+			sub(/[[:space:]]*\($/, "", token);
+			if (token != "main" && token != "if" && token != "while" && token != "for" && token != "switch" && token != "return" && token != "sizeof")
+				print token;
+			line = substr(line, RSTART + RLENGTH);
+		}
+		line2 = $0;
+		open_count = gsub(/\{/, "{", line2);
+		line2 = $0;
+		close_count = gsub(/\}/, "}", line2);
+		depth += open_count - close_count;
+		if (open_count > 0)
+			saw_open = 1;
+		if (saw_open && depth == 0)
+			exit;
+	}
+}
+' "$main_path" | sort -u
+	); then
+		die "failed to analyze function calls in '$main_path'."
+	fi
+
+	matches=()
+	seen=()
+	for fn in "${fn_names[@]}"; do
+		candidate="$dir/$fn.c"
+		if [[ -f "$candidate" && -z "${seen[$candidate]+x}" ]]; then
+			matches+=("$candidate")
+			seen["$candidate"]=1
+		fi
+	done
+
+	if [[ ${#matches[@]} -eq 1 ]]; then
+		printf '%s\n' "${matches[0]}"
+		return
+	fi
+
+	if [[ ${#matches[@]} -gt 1 ]]; then
+		echo "Error: automatic target selection is ambiguous in '$dir'." >&2
+		echo "Heuristic matches from main.c calls:" >&2
+		printf "  %s\n" "${matches[@]}" >&2
+		exit 1
+	fi
+
+	if [[ ${#candidates[@]} -eq 1 ]]; then
+		printf '%s\n' "${candidates[0]}"
+		return
+	fi
+
+	echo "Error: automatic target selection is ambiguous in '$dir'." >&2
+	echo "No unique heuristic match was found. Candidates:" >&2
+	printf "  %s\n" "${candidates[@]}" >&2
+	exit 1
+}
+
+append_main_and_delete_main() {
+	local target_file="$1"
+	local main_file="$2"
+	local exercise_dir
+	local tmp_main
+	local tmp_target
+
+	exercise_dir="$(dirname "$target_file")"
+
+	[[ -f "$target_file" ]] || die "target file '$target_file' not found."
+	[[ -r "$target_file" ]] || die "target file '$target_file' is not readable."
+	[[ -w "$target_file" ]] || die "target file '$target_file' is not writable."
+
+	[[ -f "$main_file" ]] || die "no main.c found in '$exercise_dir'."
+	[[ -r "$main_file" ]] || die "main file '$main_file' is not readable."
+	[[ -w "$exercise_dir" ]] || die "directory '$exercise_dir' is not writable."
+
+	if [[ "$target_file" == "$main_file" ]]; then
+		die "target file cannot be main.c."
+	fi
+
+	if [[ ! -s "$main_file" ]]; then
+		echo "Warning: '$main_file' is empty; skipping main transfer for '$target_file'."
+		return 0
+	fi
+
+	tmp_main="$(mktemp)" || die "failed to create temporary main file."
+	tmp_files+=("$tmp_main")
+	if ! extract_main_to_tmp "$main_file" "$tmp_main"; then
+		echo "Warning: could not extract main() from '$main_file'; skipping main transfer for '$target_file'."
+		return 0
+	fi
+
+	tmp_target="$(mktemp)" || die "failed to create temporary output file."
+	tmp_files+=("$tmp_target")
+
+	if ! awk '
+{
+	lines[NR] = $0;
+}
+END {
+	last = NR;
+	while (last > 0 && lines[last] ~ /^[[:space:]]*$/)
+		last--;
+	for (i = 1; i <= last; i++)
+		print lines[i];
+}
+' "$target_file" > "$tmp_target"; then
+		die "failed to read '$target_file'."
+	fi
+	if ! {
+		printf "/*\n"
+		cat "$tmp_main"
+		printf "*/\n"
+	} >> "$tmp_target"; then
+		die "failed to append commented main to temporary output."
+	fi
+
+	chmod --reference="$target_file" "$tmp_target" || die "failed to preserve permissions for '$target_file'."
+	mv "$tmp_target" "$target_file" || die "failed to update '$target_file'."
+
+	echo "Appended block-commented main to '$target_file'."
+}
+
+process_target_file() {
+	local target_file="$1"
+	local main_file
+
+	main_file="$(dirname "$target_file")/main.c"
+	if [[ -f "$main_file" ]]; then
+		append_main_and_delete_main "$target_file" "$main_file"
+		return
+	fi
+
+	comment_main_in_file "$target_file"
+}
+
+resolve_explicit_target() {
+	local input_path="$1"
+	local search_root
+	local target_name
+	local matches
+	local resolved
+
+	if [[ "$input_path" == /* && -f "$input_path" ]]; then
+		abs_file "$input_path" || die "failed to resolve '$input_path'."
+		return
+	fi
+
+	if [[ -f "$code_root/$input_path" ]]; then
+		abs_file "$code_root/$input_path" || die "failed to resolve '$code_root/$input_path'."
+		return
+	fi
+
+	search_root="$code_root"
+	if [[ "$input_path" == */* ]]; then
+		search_root="$code_root/${input_path%%/*}"
+		[[ -d "$search_root" ]] || die "folder '$search_root' not found."
+		[[ -r "$search_root" ]] || die "folder '$search_root' is not readable."
+	fi
+
+	target_name="$(basename "$input_path")"
+	if ! mapfile -t matches < <(find "$search_root" -type f -name "$target_name" 2>/dev/null | sort); then
+		die "failed to search for '$target_name' under '$search_root'."
+	fi
+	if [[ ${#matches[@]} -eq 0 ]]; then
+		die "no file named '$target_name' found under '$search_root'."
+	fi
+	if [[ ${#matches[@]} -gt 1 ]]; then
+		echo "Error: multiple matches found for '$target_name':" >&2
+		printf "  %s\n" "${matches[@]}" >&2
+		exit 1
+	fi
+
+	resolved="$(abs_file "${matches[0]}")" || die "failed to resolve '${matches[0]}'."
+	printf '%s\n' "$resolved"
+}
+
+resolve_folder() {
+	local input_path="$1"
+
+	if [[ "$input_path" == /* && -d "$input_path" ]]; then
+		abs_dir "$input_path" || die "failed to resolve '$input_path'."
+		return
+	fi
+
+	if [[ -d "$code_root/$input_path" ]]; then
+		abs_dir "$code_root/$input_path" || die "failed to resolve '$code_root/$input_path'."
+		return
+	fi
+
+	if [[ -d "$input_path" ]]; then
+		abs_dir "$input_path" || die "failed to resolve '$input_path'."
+		return
+	fi
+
+	die "folder '$input_path' not found."
+}
+
+for arg in "$@"; do
+	if [[ "$arg" == *=* ]]; then
+		die "configuration arguments are disabled. Edit '$config_file' and rerun."
+	fi
+done
+
+if [[ $# -ne 1 ]]; then
+	usage
+	exit 1
+fi
+
+input="$1"
+[[ -n "$input" ]] || {
+	usage
+	exit 1
+}
+
+load_config
+
+if [[ "$input" == *.c ]]; then
+	target_file="$(resolve_explicit_target "$input")"
+	process_target_file "$target_file"
+	exit 0
+fi
+
+target_folder="$(resolve_folder "$input")"
+
+if ! mapfile -t mains < <(find "$target_folder" -type f -name 'main.c' 2>/dev/null | sort); then
+	die "failed to search for main.c under '$target_folder'."
+fi
+
+processed=0
+declare -A dirs_with_external_main
+
+if [[ ${#mains[@]} -gt 0 ]]; then
+	for main_file in "${mains[@]}"; do
+		dirs_with_external_main["$(dirname "$main_file")"]=1
+		target_file="$(choose_target_for_main "$main_file")"
+		append_main_and_delete_main "$target_file" "$main_file"
+		processed=$((processed + 1))
+	done
+fi
+
+if ! mapfile -t inline_main_files < <(find "$target_folder" -type f -name '*.c' ! -name 'main.c' | sort); then
+	die "failed to scan '$target_folder' for .c files."
+fi
+for target_file in "${inline_main_files[@]}"; do
+	exercise_dir="$(dirname "$target_file")"
+	if [[ -n "${dirs_with_external_main[$exercise_dir]+x}" ]]; then
+		continue
+	fi
+	if file_has_active_main "$target_file"; then
+		comment_main_in_file "$target_file"
+		processed=$((processed + 1))
+	fi
+done
+
+if [[ $processed -eq 0 ]]; then
+	echo "No processable main() found under '$target_folder'; nothing to do."
+	exit 0
+fi
+
+echo "Processed $processed exercise file(s) under '$target_folder'."
