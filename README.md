@@ -8,9 +8,7 @@ Helper script for preparing 42 Piscine C code files. Can fix all these stuff by 
 
 ⚠️ NOTE: Please make a backup before trying it. It lets you set the path to the location of the code folder you wanna use it on, so just copy paste the whole folder to make a backup somewhere first.
 
-<div align="center">
-  <h4>Built with ❤️ by <b>l4n1skyy</b></h4>
-</div>
+<h4 align="center" >Built with ❤️ by <b>l4n1skyy</b></h4>
 
 ##  Quick Start
 
@@ -37,7 +35,3 @@ PREP_EMAIL=lanusri-@student.42kl.edu.my
 ```
 
 The script stages changes in a temporary directory, shows a summary, and asks to accept or revert.
-
-
----
-
