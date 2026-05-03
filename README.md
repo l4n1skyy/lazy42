@@ -7,6 +7,11 @@ Helper script for preparing 42 Piscine C code files. Can fix all these stuff by 
 - fixes 90% norminette errors, except like logic ones and line/function/file too long stuff
 
 ⚠️ NOTE: Please make a backup before trying it. It lets you set the path to the location of the code folder you wanna use it on, so just copy paste the whole folder to make a backup somewhere first.
+
+<div align="center">
+  <h4>Built with ❤️ by <b>l4n1skyy</b></h4>
+</div>
+
 ##  Quick Start
 
 **1. 📦 Clone and make executable:**
@@ -36,6 +41,3 @@ The script stages changes in a temporary directory, shows a summary, and asks to
 
 ---
 
-<div align="center">
-  <h4>Built with ❤️ by <b>l4n1skyy</b></h4>
-</div>
