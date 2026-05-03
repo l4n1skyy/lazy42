@@ -17,7 +17,7 @@ chmod +rwx lazy42/*
 ```
 
 **2. 🛠️ Configure (one-time):**
-Edit `scripts/prep.config`:
+Edit `lazy42/prep.config`:
 ```
 SCRIPTS_DIR='/home/l4n1skyy/Downloads/42kl-piscine-0416/lazy42/'
 CODE_DIR='/home/l4n1skyy/Documents/42kl/'
