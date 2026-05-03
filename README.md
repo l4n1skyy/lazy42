@@ -6,8 +6,7 @@ Helper script for preparing 42 Piscine C code files. Can fix all these stuff by 
 - deletes unnecessary files for submission
 - fixes 90% norminette errors, except like logic ones and line/function/file too long stuff
 
-⚠️ NOTE: Please make a backup before trying it. It lets you set the path to the location of the code folder you wanna use it on, so just copy paste the whole folder to make a backup somewhere first. The script lets you revert or accept the changes WHILE it is still running, and auto reverts if it gets interrupted, so no need to worry on that part.
-
+⚠️ NOTE: Please make a backup before trying it. It lets you set the path to the location of the code folder you wanna use it on, so just copy paste the whole folder to make a backup somewhere first.
 ##  Quick Start
 
 **1. 📦 Clone and make executable:**
