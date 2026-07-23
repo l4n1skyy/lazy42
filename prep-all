@@ -9,13 +9,14 @@ die() {
 
 usage() {
     echo "Usage:" >&2
-    echo "  $0 [folder ...]" >&2
+    echo "  $0 [folder ...] [code=/abs/path] [scripts=/abs/path]" >&2
     echo "" >&2
     echo "Before running, fill scripts/prep.config with SCRIPTS_DIR and CODE_DIR." >&2
     echo "Examples:" >&2
     echo "  $0" >&2
     echo "  $0 checkpoint00" >&2
     echo "  $0 checkpoint00/ex00 checkpoint01" >&2
+    echo "  $0 code=/home/lanusri/42kl-piscine-reloaded checkpoint00" >&2
 }
 
 require_cmd() {
@@ -28,6 +29,42 @@ done
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 config_file="$script_dir/prep.config"
+
+runtime_targets=()
+runtime_scripts_dir=""
+runtime_code_dir=""
+
+resolve_dir_arg() {
+    local raw="$1"
+
+    if [[ "$raw" == /* ]]; then
+        abs_dir "$raw" || return 1
+        return
+    fi
+
+    if [[ -d "$raw" ]]; then
+        abs_dir "$raw" || return 1
+        return
+    fi
+
+    abs_dir "$PWD/$raw" || return 1
+}
+
+write_config() {
+    local scripts_path="$1"
+    local code_path="$2"
+
+    {
+        printf 'SCRIPTS_DIR=%q\n' "$scripts_path"
+        printf 'CODE_DIR=%q\n' "$code_path"
+        if [[ -n "${PREP_USERNAME:-}" ]]; then
+            printf 'PREP_USERNAME=%q\n' "$PREP_USERNAME"
+        fi
+        if [[ -n "${PREP_EMAIL:-}" ]]; then
+            printf 'PREP_EMAIL=%q\n' "$PREP_EMAIL"
+        fi
+    } > "$config_file"
+}
 
 abs_dir() {
     local p="$1"
@@ -44,6 +81,28 @@ load_config() {
 
     [[ -n "${SCRIPTS_DIR:-}" ]] || die "SCRIPTS_DIR is not set in '$config_file'."
     [[ -n "${CODE_DIR:-}" ]] || die "CODE_DIR is not set in '$config_file'."
+}
+
+normalize_config() {
+    local resolved_code_dir
+    local resolved_script_dir
+    local changed=0
+
+    resolved_script_dir="$(abs_dir "$script_dir")" || die "script directory '$script_dir' is not a readable directory."
+    if [[ "$SCRIPTS_DIR" != "$resolved_script_dir" ]]; then
+        changed=1
+    fi
+    SCRIPTS_DIR="$resolved_script_dir"
+
+    resolved_code_dir="$(abs_dir "$CODE_DIR")" || die "CODE_DIR '$CODE_DIR' is not a readable directory."
+    if [[ "$resolved_code_dir" != "$CODE_DIR" ]]; then
+        changed=1
+    fi
+    CODE_DIR="$resolved_code_dir"
+
+    if [[ "$changed" -eq 1 ]]; then
+        write_config "$SCRIPTS_DIR" "$CODE_DIR"
+    fi
 }
 
 resolve_targets() {
@@ -405,19 +464,47 @@ run_pipeline() {
     return 2
 }
 
+parse_args() {
+    local arg
+
+    runtime_targets=()
+    runtime_scripts_dir=""
+    runtime_code_dir=""
+
+    for arg in "$@"; do
+        case "$arg" in
+            scripts=*)
+                runtime_scripts_dir="${arg#scripts=}"
+                ;;
+            code=*)
+                runtime_code_dir="${arg#code=}"
+                ;;
+            *)
+                runtime_targets+=("$arg")
+                ;;
+        esac
+    done
+}
+
 if [[ $# -gt 0 ]] && [[ "$1" == "--help" || "$1" == "-h" ]]; then
     usage
     exit 0
 fi
 
-for arg in "$@"; do
-    if [[ "$arg" == *=* ]]; then
-        die "configuration arguments are disabled. Edit '$config_file' and rerun."
-    fi
-done
-
 load_config
-SCRIPTS_DIR="$(abs_dir "$SCRIPTS_DIR")" || die "configured scripts directory '$SCRIPTS_DIR' is invalid."
-CODE_DIR="$(abs_dir "$CODE_DIR")" || die "configured code directory '$CODE_DIR' is invalid."
+parse_args "$@"
 
-run_pipeline "$SCRIPTS_DIR" "$CODE_DIR" "$@"
+if [[ -n "$runtime_scripts_dir" ]]; then
+    SCRIPTS_DIR="$(resolve_dir_arg "$runtime_scripts_dir")" || die "invalid scripts directory '$runtime_scripts_dir'."
+fi
+if [[ -n "$runtime_code_dir" ]]; then
+    CODE_DIR="$(resolve_dir_arg "$runtime_code_dir")" || die "invalid code directory '$runtime_code_dir'."
+fi
+
+normalize_config
+
+if [[ ${#runtime_targets[@]} -gt 0 ]]; then
+    run_pipeline "$SCRIPTS_DIR" "$CODE_DIR" "${runtime_targets[@]}"
+else
+    run_pipeline "$SCRIPTS_DIR" "$CODE_DIR"
+fi

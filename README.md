@@ -32,6 +32,7 @@ PREP_EMAIL=lanusri-@student.42kl.edu.my
 ./scripts/prep-all                # all modules
 ./scripts/prep-all checkpoint00   # one checkpoint folder
 ./scripts/prep-all checkpoint00 checkpoint01
+./scripts/prep-all code=/home/lanusri/42kl-piscine-reloaded checkpoint00
 ```
 
-The script stages changes in a temporary directory, shows a summary for each requested folder, and asks once whether to accept or revert the whole batch. Pass any parent folder, module folder, or specific exercise folder that lives under your configured `CODE_DIR`.
+The script stages changes in a temporary directory, shows a summary for each requested folder, and asks once whether to accept or revert the whole batch. Pass any parent folder, module folder, or specific exercise folder that lives under your configured `CODE_DIR`. If `prep.config` is stale, pass `code=/abs/path` once and `prep-all` will rewrite the config with the resolved paths.
