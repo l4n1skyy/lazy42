@@ -9,12 +9,13 @@ die() {
 
 usage() {
     echo "Usage:" >&2
-    echo "  $0 [c-01 c-02 ...]" >&2
+    echo "  $0 [folder ...]" >&2
     echo "" >&2
     echo "Before running, fill scripts/prep.config with SCRIPTS_DIR and CODE_DIR." >&2
     echo "Examples:" >&2
     echo "  $0" >&2
-    echo "  $0 c-01 c-02" >&2
+    echo "  $0 checkpoint00" >&2
+    echo "  $0 checkpoint00/ex00 checkpoint01" >&2
 }
 
 require_cmd() {
@@ -51,10 +52,10 @@ resolve_targets() {
     local input
 
     if [[ $# -eq 0 ]]; then
-        if ! mapfile -t TARGETS < <(find "$code_dir" -maxdepth 1 -mindepth 1 -type d -name 'c-[0-9][0-9]' | sort); then
-            die "failed to discover c-xx folders under '$code_dir'."
+        if ! mapfile -t TARGETS < <(find "$code_dir" -maxdepth 1 -mindepth 1 -type d | sort); then
+            die "failed to discover folders under '$code_dir'."
         fi
-        [[ ${#TARGETS[@]} -gt 0 ]] || die "no c-xx folders found under '$code_dir'."
+        [[ ${#TARGETS[@]} -gt 0 ]] || die "no folders found under '$code_dir'."
         return
     fi
 
@@ -168,6 +169,20 @@ prompt_accept_or_revert() {
     done
 }
 
+cleanup_staged_batch() {
+    local stage_root
+
+    if [[ "${BATCH_ACCEPTED:-0}" -eq 1 ]]; then
+        return 0
+    fi
+
+    for stage_root in "${STAGED_STAGE_ROOTS[@]:-}"; do
+        if [[ -n "$stage_root" && -d "$stage_root" ]]; then
+            rm -rf "$stage_root"
+        fi
+    done
+}
+
 print_remaining_norm_errors() {
     local log_file="$1"
 
@@ -209,7 +224,7 @@ END {
 ' "$log_file"
 }
 
-run_target_transaction() {
+stage_target_transaction() {
     local scripts_dir="$1"
     local code_dir="$2"
     local target="$3"
@@ -228,14 +243,12 @@ run_target_transaction() {
     local log_header
     local log_norm
     local log_norm_final
-    local accepted=0
     local main_ok="no"
     local files_ok="no"
     local header_ok="no"
     local norm_ok="no"
     local norm_changed=0
     local norm_left=0
-    local decision
 
     mkdir -p "$tmp_base"
     norm_bin="$(resolve_norm_bin "$code_dir")"
@@ -248,13 +261,6 @@ run_target_transaction() {
     log_norm="$stage_root/prep-norm.log"
     log_norm_final="$stage_root/norminette-final.log"
 
-    cleanup_stage() {
-        if [[ "${accepted:-0}" -eq 0 && -n "${stage_root:-}" && -d "${stage_root:-}" ]]; then
-            rm -rf "$stage_root"
-        fi
-    }
-    trap cleanup_stage EXIT INT TERM
-
     cp -a "$target" "$stage_target"
 
     if CODE_ROOT="$code_dir" "$prep_main" "$stage_target" > "$log_main" 2>&1; then
@@ -262,8 +268,7 @@ run_target_transaction() {
     else
         echo "prep-main failed for $(basename "$target"). Reverting staged changes."
         sed -n '1,120p' "$log_main"
-        trap - EXIT INT TERM
-        cleanup_stage
+        rm -rf "$stage_root"
         return 1
     fi
 
@@ -272,8 +277,7 @@ run_target_transaction() {
     else
         echo "prep-files failed for $(basename "$target"). Reverting staged changes."
         sed -n '1,120p' "$log_files"
-        trap - EXIT INT TERM
-        cleanup_stage
+        rm -rf "$stage_root"
         return 1
     fi
 
@@ -282,8 +286,7 @@ run_target_transaction() {
     else
         echo "prep-header failed for $(basename "$target"). Reverting staged changes."
         sed -n '1,120p' "$log_header"
-        trap - EXIT INT TERM
-        cleanup_stage
+        rm -rf "$stage_root"
         return 1
     fi
 
@@ -321,21 +324,10 @@ run_target_transaction() {
         fi
     fi
 
-    decision="$(prompt_accept_or_revert)"
-    if [[ "$decision" == "accept" ]]; then
-        rm -rf "$target"
-        mv "$stage_target" "$target"
-        accepted=1
-        rm -rf "$stage_root"
-        trap - EXIT INT TERM
-        echo "Accepted staged changes for $(basename "$target")."
-        return 0
-    fi
-
-    echo "Reverted staged changes for $(basename "$target")."
-    trap - EXIT INT TERM
-    cleanup_stage
-    return 2
+    STAGED_TARGETS+=("$target")
+    STAGED_STAGE_ROOTS+=("$stage_root")
+    STAGED_STAGE_TARGETS+=("$stage_target")
+    return 0
 }
 
 run_pipeline() {
@@ -345,9 +337,19 @@ run_pipeline() {
 
     local target
     local accepted_count=0
-    local reverted_count=0
     local fail=0
     local tmp_base
+    local decision
+    local idx
+    local stage_root
+    local stage_target
+
+    STAGED_TARGETS=()
+    STAGED_STAGE_ROOTS=()
+    STAGED_STAGE_TARGETS=()
+    BATCH_ACCEPTED=0
+
+    trap cleanup_staged_batch EXIT INT TERM
 
     [[ -x "$scripts_dir/prep-main" ]] || die "missing or non-executable '$scripts_dir/prep-main'."
     [[ -x "$scripts_dir/prep-files" ]] || die "missing or non-executable '$scripts_dir/prep-files'."
@@ -359,27 +361,48 @@ run_pipeline() {
 
     for target in "${TARGETS[@]}"; do
         echo "Processing $(basename "$target") in staged transaction..."
-        if run_target_transaction "$scripts_dir" "$code_dir" "$target" "$tmp_base"; then
+        if stage_target_transaction "$scripts_dir" "$code_dir" "$target" "$tmp_base"; then
             accepted_count=$((accepted_count + 1))
         else
-            rc=$?
-            if [[ "$rc" -eq 2 ]]; then
-                reverted_count=$((reverted_count + 1))
-            else
-                fail=$((fail + 1))
-            fi
+            fail=$((fail + 1))
         fi
     done
 
     if ((fail > 0)); then
-        die "completed with failures: accepted=$accepted_count reverted=$reverted_count failed=$fail"
+        if [[ -d "$tmp_base" ]] && ! find "$tmp_base" -mindepth 1 -print -quit | grep -q .; then
+            rm -rf "$tmp_base"
+        fi
+        cleanup_staged_batch
+        trap - EXIT INT TERM
+        die "completed with failures: accepted=$accepted_count failed=$fail"
     fi
 
-    echo "Completed successfully: accepted=$accepted_count reverted=$reverted_count failed=0."
+    decision="$(prompt_accept_or_revert)"
+    if [[ "$decision" == "accept" ]]; then
+        for idx in "${!STAGED_TARGETS[@]}"; do
+            target="${STAGED_TARGETS[$idx]}"
+            stage_root="${STAGED_STAGE_ROOTS[$idx]}"
+            stage_target="${STAGED_STAGE_TARGETS[$idx]}"
+            rm -rf "$target"
+            mv "$stage_target" "$target"
+            rm -rf "$stage_root"
+        done
+        BATCH_ACCEPTED=1
+        if [[ -d "$tmp_base" ]] && ! find "$tmp_base" -mindepth 1 -print -quit | grep -q .; then
+            rm -rf "$tmp_base"
+        fi
+        trap - EXIT INT TERM
+        echo "Accepted staged changes for $accepted_count target(s)."
+        return 0
+    fi
 
+    cleanup_staged_batch
     if [[ -d "$tmp_base" ]] && ! find "$tmp_base" -mindepth 1 -print -quit | grep -q .; then
         rm -rf "$tmp_base"
     fi
+    trap - EXIT INT TERM
+    echo "Reverted staged changes for $accepted_count target(s)."
+    return 2
 }
 
 if [[ $# -gt 0 ]] && [[ "$1" == "--help" || "$1" == "-h" ]]; then

@@ -30,8 +30,8 @@ PREP_EMAIL=lanusri-@student.42kl.edu.my
 **3. 🚀 Run:**
 ```bash
 ./scripts/prep-all                # all modules
-./scripts/prep-all c-01           # single module
-./scripts/prep-all c-01 c-02      # multiple modules
+./scripts/prep-all checkpoint00   # one checkpoint folder
+./scripts/prep-all checkpoint00 checkpoint01
 ```
 
-The script stages changes in a temporary directory, shows a summary, and asks to accept or revert.
+The script stages changes in a temporary directory, shows a summary for each requested folder, and asks once whether to accept or revert the whole batch. Pass any parent folder, module folder, or specific exercise folder that lives under your configured `CODE_DIR`.
